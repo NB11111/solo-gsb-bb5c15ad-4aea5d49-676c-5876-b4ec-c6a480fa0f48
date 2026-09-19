@@ -2,7 +2,7 @@
 
 from fastapi.testclient import TestClient
 
-from app.align import align_quotes
+from app.align import align_quotes, align_quotes_fuzzy
 from app.main import app
 
 client = TestClient(app)
@@ -126,4 +126,153 @@ def test_align_endpoint():
 
 def test_align_endpoint_rejects_bad_payload():
     resp = client.post("/quotes/align", json={"text": "x"})
+    assert resp.status_code == 422
+
+
+# --- core: fuzzy matching --------------------------------------------------
+
+
+def test_fuzzy_max_edits_zero_matches_exactly():
+    assert align_quotes_fuzzy("hello world", [("hello", 0)]) == [(0, 5, 0)]
+
+
+def test_fuzzy_substitution_enumerated_with_distance():
+    assert align_quotes_fuzzy("heXlo world", [("hello", 1)]) == [(0, 5, 1)]
+
+
+def test_fuzzy_deletion_in_text():
+    # Text is missing one quote character.
+    assert align_quotes_fuzzy("helo world", [("hello", 1)]) == [(0, 4, 1)]
+
+
+def test_fuzzy_insertion_in_text():
+    assert align_quotes_fuzzy("helloo world", [("hello", 1)]) == [(0, 5, 0)]
+
+
+def test_fuzzy_above_threshold_returns_none():
+    assert align_quotes_fuzzy("abc", [("xyz", 1)]) == [None]
+
+
+def test_fuzzy_distance_is_capped_at_threshold_of_quote():
+    assert align_quotes_fuzzy("abcde", [("xyz", 2)]) == [None]
+
+
+def test_fuzzy_blank_quote_returns_none():
+    assert align_quotes_fuzzy("some text", [("", 1), ("  ", 2)]) == [None, None]
+
+
+def test_fuzzy_unicode_code_points():
+    # One insertion + one substitution, counted per Unicode code point.
+    assert align_quotes_fuzzy("你好，世界！", [("你好世界", 2)]) == [(0, 5, 1)]
+
+
+def test_fuzzy_whitespace_collapsed_before_edits():
+    # Exact match after collapsing: zero edits.
+    assert align_quotes_fuzzy("a  b\t\nc", [("a b c", 1)]) == [(0, 7, 0)]
+    # Normalized text is "a b Xc"; the earliest distance-1 substring is
+    # "a b " (trailing space vs trailing "c"), whose space maps to the
+    # original tab, so the span covers "a  b\t".
+    assert align_quotes_fuzzy("a  b\tXc", [("a b c", 2)]) == [(0, 5, 1)]
+    assert "a  b\tXc"[0:5] == "a  b\t"
+
+
+def test_fuzzy_empty_quote_array():
+    assert align_quotes_fuzzy("anything", []) == []
+
+
+def test_fuzzy_joint_keeps_order_and_non_overlap():
+    # "ab" matches "aXb" (1 edit); "c" follows after a gap.
+    assert align_quotes_fuzzy("aXb c", [("ab", 1), ("c", 0)]) == [
+        (0, 3, 1),
+        (4, 5, 0),
+    ]
+
+
+def test_fuzzy_max_count_beats_fewer_quotes():
+    # The first quote must take the later "a" at (2,3) so both quotes fit;
+    # locating both beats anchoring on the earliest "a" and stranding "b".
+    assert align_quotes_fuzzy("aXa b", [("a", 0), ("b", 0)]) == [
+        (2, 3, 0),
+        (4, 5, 0),
+    ]
+
+
+def test_fuzzy_minimize_total_edit_distance():
+    # First quote can take the exact "ab" at 4, but that strands the second
+    # quote; spending 1 edit on "aXb" locates both (count dominates), and
+    # among joint solutions total edit distance is minimized.
+    assert align_quotes_fuzzy("aXb ab", [("ab", 1), ("ab", 0)]) == [
+        (0, 3, 1),
+        (4, 6, 0),
+    ]
+
+
+def test_fuzzy_minimize_gap_after_distance():
+    # At equal edit distance the solution skipping fewer original chars
+    # wins...
+    assert align_quotes_fuzzy("ax ay", [("a", 0), ("ay", 1)]) == [
+        (0, 1, 0),
+        (3, 5, 0),
+    ]
+    # ...and when gap is tied too, the earliest offset sequence wins.
+    assert align_quotes_fuzzy("abXXab", [("a", 0), ("b", 0)]) == [
+        (0, 1, 0),
+        (1, 2, 0),
+    ]
+
+
+def test_fuzzy_missing_quote_keeps_other_results():
+    assert align_quotes_fuzzy(
+        "alpha omega", [("alpha", 0), ("zzz", 1), ("omega", 0)]
+    ) == [(0, 5, 0), None, (6, 11, 0)]
+
+
+# --- API: fuzzy -------------------------------------------------------------
+
+
+def test_align_fuzzy_endpoint():
+    resp = client.post(
+        "/quotes/align-fuzzy",
+        json={
+            "text": "Archive  text\nwith repeats. Archive text.",
+            "quotes": [
+                {"text": "Archlve text", "max_edits": 1},
+                {"text": "repeets", "max_edits": 2},
+                {"text": "Archive text", "max_edits": 0},
+                {"text": "zzz", "max_edits": 0},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "results": [
+            {"start": 0, "end": 13, "edit_distance": 1},
+            {"start": 19, "end": 26, "edit_distance": 1},
+            {"start": 28, "end": 40, "edit_distance": 0},
+            None,
+        ]
+    }
+
+
+def test_align_fuzzy_endpoint_rejects_max_edits_above_two():
+    resp = client.post(
+        "/quotes/align-fuzzy",
+        json={"text": "hello", "quotes": [{"text": "hallo", "max_edits": 3}]},
+    )
+    assert resp.status_code == 422
+
+
+def test_align_fuzzy_endpoint_rejects_negative_max_edits():
+    resp = client.post(
+        "/quotes/align-fuzzy",
+        json={"text": "hello", "quotes": [{"text": "hallo", "max_edits": -1}]},
+    )
+    assert resp.status_code == 422
+
+
+def test_align_fuzzy_endpoint_rejects_missing_fields():
+    resp = client.post(
+        "/quotes/align-fuzzy",
+        json={"text": "hello", "quotes": [{"max_edits": 1}]},
+    )
     assert resp.status_code == 422

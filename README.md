@@ -1,6 +1,6 @@
 # Archive Quote Alignment API
 
-档案引文定位服务：给定原文与一组有序引文，返回每条引文在原文中的字符起止偏移。
+档案引文定位服务：给定原文与一组有序引文，返回每条引文在原文中的字符起止偏移；除精确匹配外，还支持允许少量编辑的模糊定位。
 
 ## 启动
 
@@ -8,14 +8,14 @@
 docker compose up --build
 ```
 
-服务地址：**http://localhost:8000**（端口 **8000**）
+服务地址：**http://localhost:8000**（端口 **8000**），新旧接口均通过该端口访问。
 
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式文档：`http://localhost:8000/docs`
 
 ## API
 
-### `POST /quotes/align`
+### `POST /quotes/align`（精确匹配，行为保持不变）
 
 请求体：
 
@@ -41,18 +41,51 @@ docker compose up --build
 
 `start` / `end` 为**原始文本**的字符偏移（`end` 为开区间），可直接用于 `text[start:end]` 切片。
 
+### `POST /quotes/align-fuzzy`（模糊匹配）
+
+每条引文包含 `text` 与 `max_edits`（允许的最大编辑距离，取值 **0～2**）。
+
+请求体：
+
+```json
+{
+  "text": "Archive  text\nwith repeats. Archive text.",
+  "quotes": [
+    {"text": "Archlve text", "max_edits": 1},
+    {"text": "repeets", "max_edits": 2},
+    {"text": "Archive text", "max_edits": 0},
+    {"text": "zzz", "max_edits": 0}
+  ]
+}
+```
+
+响应（多返回一个 `edit_distance`，表示所选片段与引文的实际编辑距离；无法定位为 `null`）：
+
+```json
+{
+  "results": [
+    {"start": 0, "end": 13, "edit_distance": 1},
+    {"start": 19, "end": 26, "edit_distance": 1},
+    {"start": 28, "end": 40, "edit_distance": 0},
+    null
+  ]
+}
+```
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`。
 
 ## 匹配规则
 
-- **空白折叠**：匹配时将原文与引文中的连续空白（空格、换行、制表符等）视为单个空格；返回的偏移始终指向原始文本的原始字符。
+- **空白折叠**：匹配时先将原文与引文中的连续空白（空格、换行、制表符等）折叠为单个空格；返回的偏移始终指向原始文本的原始字符。
+- **模糊编辑距离**（仅 `/quotes/align-fuzzy`）：在空白折叠之后，以 **Unicode 字符（码位）** 为单位计算 Levenshtein 距离，插入、删除、替换均计为 1；枚举归一化原文中所有距离不超过该引文 `max_edits`（0～2）的非空片段。
 - **重复引文**：同一引文出现多次时，各次匹配互不重叠，且保持引文数组的顺序。
 - **联合选择**：从各引文的候选位置中整体选出一组互不重叠、保持数组顺序的定位，目标依次为：
   1. 最大化成功定位的引文条数；
-  2. 最小化已定位片段之间跳过的原文字符总数（首段之前、末段之后不计）；
-  3. 仍并列时取偏移序列字典序最小的一组。
+  2. 最小化总编辑距离（精确匹配恒为 0；仅模糊接口涉及）；
+  3. 最小化已定位片段之间跳过的原文字符总数（首段之前、末段之后不计）；
+  4. 仍并列时取偏移序列字典序最小（最早）的一组。
 - 空引文或纯空白引文视为无法定位，返回 `null`。
 
 ## 本地开发（可选）
@@ -67,7 +100,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 ```
 app/
-  align.py   # 归一化、候选生成与联合选择（动态规划）
+  align.py   # 归一化、候选生成（精确与模糊）与联合选择（动态规划）
   main.py    # FastAPI 路由与请求/响应模型
 tests/       # pytest 测试
 Dockerfile
